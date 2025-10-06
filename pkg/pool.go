@@ -71,3 +71,13 @@ func (p *Pool[R]) CloseAndCollect() []R {
 
 	return collectedResults
 }
+
+// Wait allows external code to wait for all submitted tasks to complete
+func (p *Pool[R]) Wait() {
+	p.wg.Wait()
+}
+
+// Close stops accepting new jobs and closes the job channel
+func (p *Pool[R]) Close() {
+	close(p.jobs)
+}

@@ -55,14 +55,12 @@ func main() {
         })
     }
 
-    pool.Wait()
-    close(results)
-
-    // Collect and print results
-    for res := range results {
+    // Close the results channel and collect results after all tasks are done
+    pool.CloseAndCollect(results, func(res int) {
         fmt.Printf("Result: %d\n", res)
-    }
+    })
 }
+```
 ```
 
 ## Features
