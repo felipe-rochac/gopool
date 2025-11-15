@@ -16,7 +16,7 @@ A high-performance, generic worker pool implementation in Go with support for co
 ## Installation
 
 ```bash
-go get github.com/yourusername/gopool
+go get github.com/felipe-rochac/gopool
 ```
 
 ## Quick Start
@@ -28,7 +28,7 @@ import (
     "fmt"
     "time"
     
-    "github.com/yourusername/gopool/pkg/pool"
+    "github.com/felipe-rochac/gopool/pkg/pool"
 )
 
 func main() {
@@ -165,6 +165,8 @@ p.Shutdown()
 ### HTTP Request Pool
 
 ```go
+import "net/http"
+
 type HTTPResult struct {
     URL    string
     Status int
@@ -207,6 +209,8 @@ func main() {
 ### CPU-Intensive Tasks with Progress Monitoring
 
 ```go
+import "runtime"
+
 func main() {
     p := pool.NewPool[int](runtime.NumCPU())
     

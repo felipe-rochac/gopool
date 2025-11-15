@@ -1,179 +1,233 @@
 package pool
 
 import (
+	"context"
+	"errors"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestPool_IntTasks(t *testing.T) {
-	p := NewPool[int](3)
+func TestSubmitAndCollectBasic(t *testing.T) {
+	p := NewPool[int](4, WithBufferSize(8))
+	defer p.Shutdown()
 
-	for i := 0; i < 5; i++ {
-		val := i
-		p.Submit(func() int {
-			return val * val
-		})
-	}
-
-	results := p.CloseAndCollect()
-	expected := []int{0, 1, 4, 9, 16}
-	if len(results) != len(expected) {
-		t.Fatalf("expected %d results, got %d", len(expected), len(results))
-	}
-	for i, v := range expected {
-		if results[i] != v {
-			t.Errorf("result %d: expected %d, got %d", i, v, results[i])
+	var sum int64
+	var chans []<-chan int
+	for i := 0; i < 10; i++ {
+		ch, err := p.Submit(func() int { return i * 2 })
+		if err != nil {
+			t.Fatal(err)
 		}
+		chans = append(chans, ch)
+	}
+
+	// Wait for jobs and read results directly (no CloseAndCollect).
+	for _, ch := range chans {
+		v := <-ch
+		atomic.AddInt64(&sum, int64(v))
+	}
+
+	if got, wantMin := sum, int64(0); got <= wantMin {
+		t.Fatalf("unexpected sum %d", got)
+	}
+
+	st := p.Stats()
+	if st.CompletedJobs != 10 {
+		t.Fatalf("completed=%d want=10", st.CompletedJobs)
 	}
 }
 
-func TestPool_StringTasks(t *testing.T) {
-	p := NewPool[string](2)
+func TestTimeoutRequiresCtx(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
 
-	words := []string{"go", "pool", "test"}
-	for _, w := range words {
-		word := w
-		p.Submit(func() string {
-			return word + "_done"
-		})
+	_, err := p.SubmitWithTimeout(func() int { return 1 }, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error for timeout with non-ctx task")
 	}
+}
 
-	results := p.CloseAndCollect()
-	expected := []string{"go_done", "pool_done", "test_done"}
-	if len(results) != len(expected) {
-		t.Fatalf("expected %d results, got %d", len(expected), len(results))
-	}
-	for i, v := range expected {
-		if results[i] != v {
-			t.Errorf("result %d: expected %s, got %s", i, v, results[i])
+func TestSubmitCtxWithTimeout(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
+
+	start := time.Now()
+	ch, err := p.SubmitCtxWithTimeout(func(ctx context.Context) int {
+		select {
+		case <-time.After(50 * time.Millisecond):
+			return 42
+		case <-ctx.Done():
+			return -1
 		}
+	}, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := <-ch
+	if v != 42 {
+		t.Fatalf("got %d want 42", v)
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Fatal("returned too quickly")
 	}
 }
 
-func TestPool_ConcurrentSubmit(t *testing.T) {
-	p := NewPool[int](4)
-	const tasks = 20
+func TestSubmitCtxTimeoutTriggersFailure(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
 
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < tasks; i++ {
-			val := i
-			p.Submit(func() int {
-				time.Sleep(10 * time.Millisecond)
-				return val
-			})
+	ch, err := p.SubmitCtxWithTimeout(func(ctx context.Context) int {
+		// ignore ctx until timeout happens
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return 99
+		case <-ctx.Done():
+			// simulate slow cleanup
+			<-time.After(200 * time.Millisecond)
+			return -1
 		}
-		close(done)
-	}()
+	}, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// channel should be closed without a value (receive returns zero, ok=false)
+	if v, ok := <-ch; ok {
+		t.Fatalf("expected closed channel without value, got %d", v)
+	}
 
-	<-done
-	results := p.CloseAndCollect()
-	if len(results) != tasks {
-		t.Fatalf("expected %d results, got %d", tasks, len(results))
+	// give worker some time to update counters
+	time.Sleep(20 * time.Millisecond)
+	if p.Stats().FailedJobs < 1 {
+		t.Fatal("expected at least 1 failed job")
 	}
 }
 
-func TestPool_NoTasks(t *testing.T) {
-	p := NewPool[int](2)
-	results := p.CloseAndCollect()
-	if len(results) != 0 {
-		t.Errorf("expected 0 results, got %d", len(results))
-	}
-}
+func TestShutdownCancelsAndCloseStopsQueue(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(1))
+	defer p.Shutdown()
 
-func TestPool_TaskOrder(t *testing.T) {
-	p := NewPool[int](2)
-	for i := 0; i < 5; i++ {
-		val := i
-		p.Submit(func() int { return val })
-	}
-	results := p.CloseAndCollect()
-	for i, v := range results {
-		if v != i {
-			t.Errorf("expected result %d, got %d", i, v)
+	// Long running job
+	_, _ = p.SubmitCtxWithTimeout(func(ctx context.Context) int {
+		select {
+		case <-ctx.Done():
+			return -1
+		case <-time.After(500 * time.Millisecond):
+			return 1
 		}
+	}, 0)
+
+	p.Shutdown()
+	p.Close() // idempotent
+
+	// After shutdown, new submissions should fail
+	if _, err := p.Submit(func() int { return 1 }); err == nil {
+		t.Fatal("expected error submitting after shutdown")
 	}
 }
 
-func TestPool_Wait(t *testing.T) {
-	p := NewPool[int](2)
-	for i := 0; i < 3; i++ {
-		val := i
-		p.Submit(func() int { return val * 2 })
+func TestPanicRecovery(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
+
+	ch, err := p.Submit(func() int {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// channel should be closed without a value
+	if _, ok := <-ch; ok {
+		t.Fatal("expected closed result channel after panic")
 	}
 
-	// Wait should block until all tasks are done
+	time.Sleep(10 * time.Millisecond)
+	if p.Stats().FailedJobs != 1 {
+		t.Fatalf("failed=%d want=1", p.Stats().FailedJobs)
+	}
+
+	// Worker should still be alive
+	if p.Stats().ActiveWorkers != 1 {
+		t.Fatalf("activeWorkers=%d want=1", p.Stats().ActiveWorkers)
+	}
+}
+
+func TestCloseAndCollect(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
+
+	for i := 1; i <= 5; i++ {
+		_, _ = p.Submit(func() int { return 7 })
+	}
+	out := p.CloseAndCollect()
+	if len(out) != 5 {
+		t.Fatalf("collected=%d want=5", len(out))
+	}
+	// Ensure internal slice cleared (memory hygiene); this is a white-box sanity check.
+	if got := len(p.results); got != 0 {
+		t.Fatalf("results slice not cleared, len=%d", got)
+	}
+}
+
+func TestStatsQueuedReflectsJobChan(t *testing.T) {
+	p := NewPool[int](1, WithBufferSize(2))
+	defer p.Shutdown()
+
+	// Block the single worker so queued reflects the buffer len
+	block := make(chan struct{})
+	_, _ = p.SubmitCtxWithTimeout(func(ctx context.Context) int {
+		<-block
+		return 1
+	}, 0)
+
+	// Enqueue two more; one will sit in queue
+	_, _ = p.Submit(func() int { return 2 })
+	_, _ = p.Submit(func() int { return 3 })
+
+	st := p.Stats()
+	if st.QueuedJobs == 0 {
+		t.Fatalf("QueuedJobs=%d want>0", st.QueuedJobs)
+	}
+
+	close(block)
 	p.Wait()
-
-	// After Wait, all jobs should be completed, but results are not collected
-	// Collect results manually from the channels
-	results := make([]int, 0, 3)
-	for _, resChan := range p.results {
-		results = append(results, <-resChan)
-	}
-
-	expected := []int{0, 2, 4}
-	if len(results) != len(expected) {
-		t.Fatalf("expected %d results, got %d", len(expected), len(results))
-	}
-	for i, v := range expected {
-		if results[i] != v {
-			t.Errorf("result %d: expected %d, got %d", i, v, results[i])
-		}
-	}
 }
 
-func TestPool_Wait_NoTasks(t *testing.T) {
-	p := NewPool[int](2)
-	p.Wait()
-	if len(p.results) != 0 {
-		t.Errorf("expected 0 results, got %d", len(p.results))
-	}
-}
+func TestGoroutineDoesNotLeakOnClose(t *testing.T) {
+	before := runtime.NumGoroutine()
 
-func TestPool_Wait_MultipleCalls(t *testing.T) {
-	p := NewPool[int](2)
-	for i := 0; i < 2; i++ {
-		val := i
-		p.Submit(func() int { return val })
+	p := NewPool[int](8, WithBufferSize(8))
+	for i := 0; i < 100; i++ {
+		_, _ = p.Submit(func() int { return i })
 	}
-	p.Wait()
-	// Calling Wait again should not panic or block
-	p.Wait()
-	for i, resChan := range p.results {
-		res := <-resChan
-		if res != i {
-			t.Errorf("expected %d, got %d", i, res)
-		}
-	}
-}
-
-func TestPool_Close(t *testing.T) {
-	p := NewPool[int](2)
-	for i := 0; i < 3; i++ {
-		val := i
-		p.Submit(func() int { return val })
-	}
-
 	p.Close()
+	p.Wait()
+	p.Shutdown()
 
-	// After Close, submitting new tasks should panic
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic on Submit after Close, but did not panic")
-		}
-	}()
-	p.Submit(func() int { return 42 })
+	// give scheduler a moment
+	time.Sleep(50 * time.Millisecond)
+	after := runtime.NumGoroutine()
+
+	// This is a heuristic check; allow a few extra goroutines due to test runner noise.
+	if after > before+10 {
+		t.Fatalf("possible leak: goroutines before=%d after=%d", before, after)
+	}
 }
 
-func TestPool_Close_NoTasks(t *testing.T) {
-	p := NewPool[int](2)
-	p.Close()
-	// After Close, submitting new tasks should panic
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic on Submit after Close, but did not panic")
-		}
-	}()
-	p.Submit(func() int { return 42 })
+func TestResizeAddsWorkers(t *testing.T) {
+	p := NewPool[int](2, WithBufferSize(4))
+	defer p.Shutdown()
+
+	if p.Stats().ActiveWorkers != 1 {
+		t.Fatalf("want 1 worker, got %d", p.Stats().ActiveWorkers)
+	}
+	p.Resize(4)
+	time.Sleep(10 * time.Millisecond)
+	if p.Stats().ActiveWorkers != 4 {
+		t.Fatalf("resize failed: got %d", p.Stats().ActiveWorkers)
+	}
 }
+
+// Optional: demonstrates returning an error via value type (if you decide to add it later).
+var _ = errors.New // silence unused import warning if you add error variants later

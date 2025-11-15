@@ -8,39 +8,44 @@ import (
 	"time"
 )
 
-// Job is the wrapper for a task, carrying its return channel
+// Job is a unit of work executed by the pool.
+// Either DoCtx or Do must be provided. If Timeout > 0, DoCtx is required.
 type Job[R any] struct {
-	Do      func() R
-	DoCtx   func(context.Context) R // Context-aware task
-	Result  chan R
-	Timeout time.Duration
+	Do      func() R                // non-context task (no timeout enforcement)
+	DoCtx   func(context.Context) R // context-aware task (supports timeout/cancel)
+	Result  chan R                  // caller receives exactly one value OR channel is closed with no value on failure/timeout
+	Timeout time.Duration           // per-job timeout (requires DoCtx)
 }
 
-// PoolStats provides statistics about the pool
+// PoolStats provides runtime statistics about the pool.
 type PoolStats struct {
 	WorkersCount  int
-	QueuedJobs    int
+	QueuedJobs    int // length of the job queue
 	CompletedJobs int64
 	FailedJobs    int64
-	ActiveWorkers int64
+	ActiveWorkers int64 // currently running worker goroutines
 }
 
-// Pool manages the generic worker goroutines
+// Pool manages worker goroutines processing submitted jobs.
 type Pool[R any] struct {
-	jobs          chan Job[R]
-	results       []chan R
-	wg            sync.WaitGroup
-	workers       int
-	closed        int32
-	ctx           context.Context
-	cancel        context.CancelFunc
+	jobs           chan Job[R]
+	results        []chan R // kept only for CloseAndCollect
+	wg             sync.WaitGroup
+	workers        int
+	closed         int32
+	ctx            context.Context
+	cancel         context.CancelFunc
+	defaultTimeout time.Duration
+
 	completedJobs int64
 	failedJobs    int64
 	activeWorkers int64
-	mu            sync.RWMutex
+	activeJobs    int64
+
+	mu sync.RWMutex
 }
 
-// PoolOption allows configuration of the pool
+// PoolOption customizes the pool at construction.
 type PoolOption func(*poolConfig)
 
 type poolConfig struct {
@@ -48,48 +53,47 @@ type poolConfig struct {
 	timeout    time.Duration
 }
 
-// WithBufferSize sets the job queue buffer size
+// WithBufferSize sets the job queue buffer size.
 func WithBufferSize(size int) PoolOption {
-	return func(c *poolConfig) {
-		c.bufferSize = size
-	}
+	return func(c *poolConfig) { c.bufferSize = size }
 }
 
-// WithTimeout sets a default timeout for jobs
+// WithTimeout sets a default timeout for jobs (applies to SubmitCtx* when no explicit timeout provided).
 func WithTimeout(timeout time.Duration) PoolOption {
-	return func(c *poolConfig) {
-		c.timeout = timeout
-	}
+	return func(c *poolConfig) { c.timeout = timeout }
 }
 
-// NewPool initializes and starts the specified number of generic workers
+// NewPool starts a pool with N workers.
 func NewPool[R any](workers int, opts ...PoolOption) *Pool[R] {
-	config := &poolConfig{
-		bufferSize: 0, // Unbuffered by default
-		timeout:    0, // No timeout by default
+	if workers <= 0 {
+		workers = 1
 	}
 
+	cfg := &poolConfig{
+		bufferSize: 0,
+		timeout:    0,
+	}
 	for _, opt := range opts {
-		opt(config)
+		opt(cfg)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Pool[R]{
-		jobs:    make(chan Job[R], config.bufferSize),
-		workers: workers,
-		ctx:     ctx,
-		cancel:  cancel,
+		jobs:           make(chan Job[R], cfg.bufferSize),
+		workers:        workers,
+		ctx:            ctx,
+		cancel:         cancel,
+		defaultTimeout: cfg.timeout,
+		results:        make([]chan R, 0, 64),
 	}
 
-	// Launch worker goroutines
-	for range workers {
+	for i := 0; i < workers; i++ {
 		go p.worker()
 	}
 	return p
 }
 
-// worker function processes jobs from the channel
 func (p *Pool[R]) worker() {
 	atomic.AddInt64(&p.activeWorkers, 1)
 	defer atomic.AddInt64(&p.activeWorkers, -1)
@@ -107,190 +111,196 @@ func (p *Pool[R]) worker() {
 	}
 }
 
-// processJob handles individual job execution with timeout support
 func (p *Pool[R]) processJob(job Job[R]) {
+	atomic.AddInt64(&p.activeJobs, 1)
+	defer atomic.AddInt64(&p.activeJobs, -1)
 	defer p.wg.Done()
 
-	var result R
-	var success bool
+	// Panic safety: one bad job should not kill the worker.
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&p.failedJobs, 1)
+			// signal completion to consumer even on failure
+			close(job.Result)
+		}
+	}()
 
-	// Create job context with timeout if specified
+	// Derive job context with timeout if configured.
 	jobCtx := p.ctx
+	if job.Timeout <= 0 && p.defaultTimeout > 0 {
+		job.Timeout = p.defaultTimeout
+	}
 	if job.Timeout > 0 {
+		if job.Do != nil && job.DoCtx == nil {
+			// timeouts require cooperation; fail fast for non-ctx job with timeout requested
+			atomic.AddInt64(&p.failedJobs, 1)
+			close(job.Result)
+			return
+		}
 		var cancel context.CancelFunc
 		jobCtx, cancel = context.WithTimeout(p.ctx, job.Timeout)
 		defer cancel()
 	}
 
-	// Execute job with timeout handling
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if job.DoCtx != nil {
-			result = job.DoCtx(jobCtx)
-		} else {
-			result = job.Do()
-		}
-		success = true
-	}()
+	var (
+		result R
+	)
 
+	switch {
+	case job.DoCtx != nil:
+		result = job.DoCtx(jobCtx)
+	case job.Do != nil:
+		// No timeout enforcement here; Do ignores ctx.
+		result = job.Do()
+	default:
+		atomic.AddInt64(&p.failedJobs, 1)
+		close(job.Result)
+		return
+	}
+
+	// If context timed out or was canceled while running, mark as failed.
 	select {
-	case <-done:
-		if success {
-			atomic.AddInt64(&p.completedJobs, 1)
-			job.Result <- result
-		}
 	case <-jobCtx.Done():
 		atomic.AddInt64(&p.failedJobs, 1)
-		// Don't send to result channel on timeout
+		close(job.Result)
+		return
+	default:
 	}
+
+	// Deliver result and close the channel so callers can range/receive deterministically.
+	atomic.AddInt64(&p.completedJobs, 1)
+	job.Result <- result
+	close(job.Result)
 }
 
-// Submit adds a task to the pool
-func (p *Pool[R]) Submit(task func() R) error {
+// Submit enqueues a non-context job (no timeout). Returns the job's result channel.
+func (p *Pool[R]) Submit(task func() R) (<-chan R, error) {
 	return p.SubmitWithTimeout(task, 0)
 }
 
-// SubmitCtx adds a context-aware task to the pool
-func (p *Pool[R]) SubmitCtx(task func(context.Context) R) error {
+// SubmitCtx enqueues a context-aware job (cooperates with cancel/timeout). Returns the job's result channel.
+func (p *Pool[R]) SubmitCtx(task func(context.Context) R) (<-chan R, error) {
 	return p.SubmitCtxWithTimeout(task, 0)
 }
 
-// SubmitWithTimeout adds a task with a specific timeout
-func (p *Pool[R]) SubmitWithTimeout(task func() R, timeout time.Duration) error {
+// SubmitWithTimeout enqueues a non-context job with a requested timeout (not supported).
+// If timeout > 0 and the task is not context-aware, the job is rejected.
+func (p *Pool[R]) SubmitWithTimeout(task func() R, timeout time.Duration) (<-chan R, error) {
 	if atomic.LoadInt32(&p.closed) == 1 {
-		return errors.New("pool is closed")
+		return nil, errors.New("pool is closed")
+	}
+	if timeout > 0 {
+		return nil, errors.New("timeout requires SubmitCtx/DoCtx task")
 	}
 
 	resultChan := make(chan R, 1)
-	job := Job[R]{
-		Do:      task,
-		Result:  resultChan,
-		Timeout: timeout,
-	}
+	job := Job[R]{Do: task, Result: resultChan}
 
 	p.mu.Lock()
 	p.results = append(p.results, resultChan)
 	p.mu.Unlock()
 
 	p.wg.Add(1)
-
 	select {
 	case p.jobs <- job:
-		return nil
+		return resultChan, nil
 	case <-p.ctx.Done():
 		p.wg.Done()
-		return errors.New("pool is shutting down")
+		return nil, errors.New("pool is shutting down")
 	}
 }
 
-// SubmitCtxWithTimeout adds a context-aware task with timeout
-func (p *Pool[R]) SubmitCtxWithTimeout(task func(context.Context) R, timeout time.Duration) error {
+// SubmitCtxWithTimeout enqueues a context-aware job with an optional timeout. Returns the job's result channel.
+func (p *Pool[R]) SubmitCtxWithTimeout(task func(context.Context) R, timeout time.Duration) (<-chan R, error) {
 	if atomic.LoadInt32(&p.closed) == 1 {
-		return errors.New("pool is closed")
+		return nil, errors.New("pool is closed")
+	}
+	if timeout == 0 {
+		timeout = p.defaultTimeout
 	}
 
 	resultChan := make(chan R, 1)
-	job := Job[R]{
-		DoCtx:   task,
-		Result:  resultChan,
-		Timeout: timeout,
-	}
+	job := Job[R]{DoCtx: task, Result: resultChan, Timeout: timeout}
 
 	p.mu.Lock()
 	p.results = append(p.results, resultChan)
 	p.mu.Unlock()
 
 	p.wg.Add(1)
-
 	select {
 	case p.jobs <- job:
-		return nil
+		return resultChan, nil
 	case <-p.ctx.Done():
 		p.wg.Done()
-		return errors.New("pool is shutting down")
+		return nil, errors.New("pool is shutting down")
 	}
 }
 
-// CloseAndCollect safely stops the pool and returns all results
-func (p *Pool[R]) CloseAndCollect() []R {
-	p.Close()
-	p.Wait()
-
-	p.mu.RLock()
-	collectedResults := make([]R, 0, len(p.results))
-
-	for _, resChan := range p.results {
-		select {
-		case result := <-resChan:
-			collectedResults = append(collectedResults, result)
-		default:
-			// Skip channels that don't have results (failed/timeout jobs)
-		}
-	}
-	p.mu.RUnlock()
-
-	return collectedResults
-}
-
-// Wait waits for all submitted tasks to complete
-func (p *Pool[R]) Wait() {
-	p.wg.Wait()
-}
-
-// Close gracefully shuts down the pool
+// Close stops accepting new jobs and closes the queue. Existing jobs continue.
 func (p *Pool[R]) Close() {
 	if atomic.CompareAndSwapInt32(&p.closed, 0, 1) {
 		close(p.jobs)
 	}
 }
 
-// Shutdown forcefully shuts down the pool with context cancellation
+// Shutdown cancels all workers and also closes the queue.
 func (p *Pool[R]) Shutdown() {
 	p.cancel()
 	p.Close()
 }
 
-// Stats returns current pool statistics
-func (p *Pool[R]) Stats() PoolStats {
-	p.mu.RLock()
-	queuedJobs := len(p.results)
-	p.mu.RUnlock()
+// Wait blocks until all submitted jobs have finished.
+func (p *Pool[R]) Wait() { p.wg.Wait() }
 
+// CloseAndCollect waits for completion, then collects available results once and clears the internal slice.
+// Results of timed-out/failed jobs won't be present (their channels are closed without a value).
+func (p *Pool[R]) CloseAndCollect() []R {
+	p.Close()
+	p.Wait()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	collected := make([]R, 0, len(p.results))
+	for _, ch := range p.results {
+		if ch == nil {
+			continue
+		}
+		// since each result chan is closed by the worker, a single receive is enough:
+		if v, ok := <-ch; ok {
+			collected = append(collected, v)
+		}
+	}
+	p.results = nil // avoid unbounded growth across runs
+	return collected
+}
+
+// Stats returns current statistics.
+func (p *Pool[R]) Stats() PoolStats {
 	return PoolStats{
 		WorkersCount:  p.workers,
-		QueuedJobs:    queuedJobs,
+		QueuedJobs:    len(p.jobs),
 		CompletedJobs: atomic.LoadInt64(&p.completedJobs),
 		FailedJobs:    atomic.LoadInt64(&p.failedJobs),
 		ActiveWorkers: atomic.LoadInt64(&p.activeWorkers),
 	}
 }
 
-// Resize changes the number of workers (experimental)
+// Resize adds more workers (downscale is not implemented).
 func (p *Pool[R]) Resize(newWorkerCount int) {
-	if newWorkerCount <= 0 {
+	if newWorkerCount <= p.workers {
+		p.workers = newWorkerCount
 		return
 	}
-
-	currentWorkers := p.workers
-	diff := newWorkerCount - currentWorkers
-
-	if diff > 0 {
-		// Add workers
-		for i := 0; i < diff; i++ {
-			go p.worker()
-		}
+	diff := newWorkerCount - p.workers
+	for i := 0; i < diff; i++ {
+		go p.worker()
 	}
-	// Note: Reducing workers is more complex and requires additional signaling
-
 	p.workers = newWorkerCount
 }
 
-// IsEmpty returns true if no jobs are queued or being processed
+// IsEmpty reports whether no jobs are queued and no jobs are being processed.
+// (Workers can still be alive; use ActiveWorkers for that.)
 func (p *Pool[R]) IsEmpty() bool {
-	p.mu.RLock()
-	queued := len(p.results)
-	p.mu.RUnlock()
-
-	return queued == 0 && atomic.LoadInt64(&p.activeWorkers) == 0
+	return len(p.jobs) == 0 && atomic.LoadInt64(&p.activeJobs) == 0
 }
